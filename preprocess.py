@@ -48,8 +48,7 @@ def process_data():
     
     X_train, y_train, device_train = [], [], []
     X_test, y_test, device_test = [], [], []
-    
-    # İstatistikler
+
     stats = {'Normal': 0, 'Crackle': 0, 'Wheeze': 0, 'Both': 0}
     
     for index, row in tqdm(split_df.iterrows(), total=split_df.shape[0]):

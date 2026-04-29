@@ -1,0 +1,49 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+.python-version
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage outputs
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Notebooks and logs
+.ipynb_checkpoints/
+*.log
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# Project data and training outputs
+data/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Generated metadata/artifacts
+icbhi_ast_16k_8s_metadata.npz
+
+# OS files
+.DS_Store
+Thumbs.db
