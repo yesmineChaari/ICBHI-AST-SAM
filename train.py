@@ -1,14 +1,5 @@
-"""
-Changes:
-  1. CrossEntropyLoss replaced with AsymmetricLoss (ASL)
-  2. Best-model criterion: Se-first with a Sp floor guard (Sp >= 60%)
-  3. weights_only=False on torch.load  (fixes PyTorch 2.6 error)
-
-"""
-
 import os
 import argparse
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,40 +9,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import ASTFeatureExtractor
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
-
 from src.dataset import ASTDataset
 from src.model   import CustomAST, EMA
 from src.sam     import FSAM
 
 
-# ── Asymmetric Loss ───────────────────────────────────────────────────────────
-
-class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_pos: float = 3.0, gamma_neg: float = 0.0,
-                 label_smoothing: float = 0.1):
-        super().__init__()
-        self.gamma_pos       = gamma_pos
-        self.gamma_neg       = gamma_neg
-        self.label_smoothing = label_smoothing
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        num_classes = logits.size(1)
-        probs       = F.softmax(logits, dim=1).clamp(1e-7, 1 - 1e-7)
-
-        # Smooth one-hot targets
-        targets_oh  = F.one_hot(targets, num_classes).float()
-        if self.label_smoothing > 0:
-            targets_oh = targets_oh * (1 - self.label_smoothing) \
-                       + self.label_smoothing / num_classes
-
-        # Focal weights — asymmetric
-        focal_pos = (1 - probs) ** self.gamma_pos   # penalty for FN (true class missed)
-        focal_neg = probs        ** self.gamma_neg   # penalty for FP (wrong class fired)
-
-        focal_weight = targets_oh * focal_pos + (1 - targets_oh) * focal_neg
-
-        loss = -targets_oh * focal_weight * torch.log(probs)
-        return loss.sum(dim=1).mean()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -104,11 +66,12 @@ def train(args):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("🧠 Preparing model")
-    model = CustomAST(num_classes=4, freeze_layers=8).to(DEVICE)
+    # PHASE 1: Freeze all 12 transformer layers so only the head trains initially.
+    model = CustomAST(num_classes=4, freeze_layers=12).to(DEVICE)
 
     # ── Loss ──────────────────────────────────────────────────────────────────
-    criterion = AsymmetricLoss(gamma_pos=3.0, gamma_neg=0.0, label_smoothing=0.1)
-
+# Reverted to standard Cross Entropy to let the Sampler do its job without double-dipping.
+    criterion = nn.CrossEntropyLoss()
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = FSAM(
         model.parameters(),
@@ -152,8 +115,23 @@ def train(args):
     print(f"   Goal  : beat Se=68.31%  keep Sp ≥ {SP_FLOOR*100:.0f}%")
     print(f"   SOTA  : Se=68.31%  Sp=67.89%  Score=68.10%")
     print("=" * 60)
-
+# ── Log File Setup ────────────────────────────────────────────────────────
+    log_path = os.path.join(args.checkpoint_dir, "training_log.csv")
+    
+    # If starting from epoch 1, create a fresh file and write the header
+    if start_epoch == 1 or not os.path.exists(log_path):
+        with open(log_path, "w") as f:
+            f.write("Epoch,Train_Loss,Val_Se,Val_Sp,Val_Score\n")
+            
     for epoch in range(start_epoch, args.epochs + 1):
+        # ── Two-Phase Training Logic ──────────────────────────────────────────
+        if epoch == 7:
+            print("\n🔓 Phase 2: Unfreezing upper 4 AST layers for fine-tuning...")
+            for i, layer in enumerate(model.ast.audio_spectrogram_transformer.encoder.layer):
+                if i >= 8:  # Keep bottom 8 frozen, unfreeze top 4
+                    for param in layer.parameters():
+                        param.requires_grad = True
+
         model.train()
         running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
@@ -201,6 +179,11 @@ def train(args):
             f"Se={se*100:.2f}%{beat_se}  Sp={sp*100:.2f}%  Score={score*100:.2f}%{sp_warn}"
         )
 
+        # ── NEW: Append metrics to log file ───────────────────────────────────
+        with open(log_path, "a") as f:
+            f.write(f"{epoch},{running_loss/len(train_loader):.4f},{se:.4f},{sp:.4f},{score:.4f}\n")
+
+        # Save best: Se-first, only when Sp >= floor
         # Save best: Se-first, only when Sp >= floor
         if sp >= SP_FLOOR and se > best_se:
             best_se            = se
