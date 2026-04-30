@@ -32,7 +32,10 @@ def train(args):
     SP_FLOOR = 0.60
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_gpus = torch.cuda.device_count()
     print(f"⚙️  Device: {DEVICE}")
+    if num_gpus > 1:
+        print(f"⚙️  Multi-GPU: {num_gpus} GPUs detected")
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -68,6 +71,9 @@ def train(args):
     print("🧠 Preparing model")
     # PHASE 1: Freeze all 12 transformer layers so only the head trains initially.
     model = CustomAST(num_classes=4, freeze_layers=12).to(DEVICE)
+    if num_gpus > 1:
+        model = nn.DataParallel(model)
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
 
     # ── Loss ──────────────────────────────────────────────────────────────────
 # Reverted to standard Cross Entropy to let the Sampler do its job without double-dipping.
@@ -90,7 +96,7 @@ def train(args):
     )
 
     # ── EMA ───────────────────────────────────────────────────────────────────
-    ema = EMA(model, decay=0.999)
+    ema = EMA(base_model, decay=0.999)
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch        = 1
@@ -101,7 +107,7 @@ def train(args):
     if os.path.exists(resume_path):
         print(f"🔄 Resuming from: {resume_path}")
         ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        base_model.load_state_dict(ckpt["model"])
         optimizer.base_optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         ema.load_state_dict(ckpt["ema"])
@@ -127,7 +133,7 @@ def train(args):
         # ── Two-Phase Training Logic ──────────────────────────────────────────
         if epoch == 7:
             print("\n🔓 Phase 2: Unfreezing upper 4 AST layers for fine-tuning...")
-            for i, layer in enumerate(model.ast.audio_spectrogram_transformer.encoder.layer):
+            for i, layer in enumerate(base_model.ast.audio_spectrogram_transformer.encoder.layer):
                 if i >= 8:  # Keep bottom 8 frozen, unfreeze top 4
                     for param in layer.parameters():
                         param.requires_grad = True
@@ -148,14 +154,14 @@ def train(args):
             criterion(model(inputs), labels).backward()
             optimizer.second_step(zero_grad=True)
 
-            ema.update(model)
+            ema.update(base_model)
             running_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         scheduler.step()
 
         # ── Eval with EMA weights ─────────────────────────────────────────────
-        ema.apply_shadow(model)
+        ema.apply_shadow(base_model)
         model.eval()
         all_preds, all_labels_list = [], []
 
@@ -166,7 +172,7 @@ def train(args):
                 all_preds.extend(preds.cpu().numpy())
                 all_labels_list.extend(labels.numpy())
 
-        ema.restore(model)
+        ema.restore(base_model)
 
         se, sp, score = icbhi_score(all_preds, all_labels_list)
         lr_now        = optimizer.base_optimizer.param_groups[0]["lr"]
@@ -191,7 +197,7 @@ def train(args):
             torch.save(
                 {
                     "epoch": epoch,
-                    "model": model.state_dict(),
+                    "model": base_model.state_dict(),
                     "ema":   ema.state_dict(),
                     "se":    best_se,
                     "sp":    sp,
@@ -205,7 +211,7 @@ def train(args):
         torch.save(
             {
                 "epoch":              epoch,
-                "model":              model.state_dict(),
+                "model":              base_model.state_dict(),
                 "optimizer":          optimizer.base_optimizer.state_dict(),
                 "scheduler":          scheduler.state_dict(),
                 "ema":                ema.state_dict(),

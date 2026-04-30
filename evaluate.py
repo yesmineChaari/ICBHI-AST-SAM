@@ -5,6 +5,7 @@ import argparse
 import pandas as pd
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import ASTFeatureExtractor
 from sklearn.metrics import confusion_matrix
@@ -20,8 +21,11 @@ def evaluate(args):
     torch.cuda.empty_cache()
 
     DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_gpus = torch.cuda.device_count()
     CLASSES = ["Normal", "Crackle", "Wheeze", "Both"]
     print(f"⚙️  Device: {DEVICE}")
+    if num_gpus > 1:
+        print(f"⚙️  Multi-GPU: {num_gpus} GPUs detected")
 
     # ── Data ──────────────────────────────────────────────────────────────────
     print(f"📦 Loading data: {args.data_path}")
@@ -48,19 +52,22 @@ def evaluate(args):
 
     checkpoint = torch.load(args.model_path, map_location=DEVICE, weights_only=False)
     model      = CustomAST(num_classes=4, freeze_layers=8).to(DEVICE)
+    if num_gpus > 1:
+        model = nn.DataParallel(model)
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
 
     if isinstance(checkpoint, dict) and "ema" in checkpoint:
         # Load EMA shadow weights — better generalisation than raw weights
-        ema = EMA(model, decay=0.999)
+        ema = EMA(base_model, decay=0.999)
         ema.load_state_dict(checkpoint["ema"])
-        ema.apply_shadow(model)
+        ema.apply_shadow(base_model)
         print("   ✅ Loaded EMA shadow weights")
     elif isinstance(checkpoint, dict) and "model" in checkpoint:
-        model.load_state_dict(checkpoint["model"])
+        base_model.load_state_dict(checkpoint["model"])
         print("   ✅ Loaded model weights")
     else:
         # Original checkpoint format (plain state dict)
-        model.load_state_dict(checkpoint)
+        base_model.load_state_dict(checkpoint)
         print("   ✅ Loaded raw state dict")
 
     model.eval()
