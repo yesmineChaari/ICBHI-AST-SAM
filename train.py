@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader          # ← CHANGED: removed WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import ASTFeatureExtractor
 from sklearn.metrics import confusion_matrix
@@ -12,8 +12,6 @@ from tqdm import tqdm
 from src.dataset import ASTDataset
 from src.model   import CustomAST, EMA
 from src.sam     import FSAM
-
-
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -29,7 +27,7 @@ def icbhi_score(all_preds, all_labels):
 
 def train(args):
 
-    SP_FLOOR = 0.60
+    SCORE_FLOOR = 0.6200   # ← CHANGED: gate on balanced score, not Se-only
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_gpus = torch.cuda.device_count()
@@ -51,15 +49,11 @@ def train(args):
         "MIT/ast-finetuned-audioset-10-10-0.4593"
     )
 
-    # WeightedRandomSampler
-    counts         = np.bincount(y_train)
-    sample_weights = [1.0 / counts[y] for y in y_train]
-    sampler        = WeightedRandomSampler(sample_weights, len(y_train))
-
+    # ← CHANGED: removed WeightedRandomSampler — class-weighted loss handles imbalance instead
     train_loader = DataLoader(
         ASTDataset(X_train, y_train, d_train, processor, train=True),
         batch_size=args.batch_size,
-        sampler=sampler,
+        shuffle=True,
     )
     test_loader = DataLoader(
         ASTDataset(X_test, y_test, d_test, processor, train=False),
@@ -69,15 +63,18 @@ def train(args):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("🧠 Preparing model")
-    # PHASE 1: Freeze all 12 transformer layers so only the head trains initially.
     model = CustomAST(num_classes=4, freeze_layers=12).to(DEVICE)
     if num_gpus > 1:
         model = nn.DataParallel(model)
     base_model = model.module if isinstance(model, nn.DataParallel) else model
 
-    # ── Loss ──────────────────────────────────────────────────────────────────
-# Reverted to standard Cross Entropy to let the Sampler do its job without double-dipping.
-    criterion = nn.CrossEntropyLoss()
+    # ── Loss  ─────────────────────────────────────────────────────────────────
+    # ← CHANGED: class-weighted CE + label smoothing replaces plain CE + sampler
+    counts = np.bincount(y_train)
+    class_weights = torch.tensor(1.0 / counts, dtype=torch.float32).to(DEVICE)
+    class_weights = class_weights / class_weights.sum() * len(counts)  # normalise
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = FSAM(
         model.parameters(),
@@ -99,10 +96,9 @@ def train(args):
     ema = EMA(base_model, decay=0.999)
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    start_epoch        = 1
-    best_se            = 0.0
-    best_sp_at_best_se = 0.0
-    resume_path        = os.path.join(args.checkpoint_dir, "resume.pth")
+    start_epoch  = 1
+    best_score   = 0.0          # ← CHANGED: track best overall score
+    resume_path  = os.path.join(args.checkpoint_dir, "resume.pth")
 
     if os.path.exists(resume_path):
         print(f"🔄 Resuming from: {resume_path}")
@@ -111,30 +107,27 @@ def train(args):
         optimizer.base_optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         ema.load_state_dict(ckpt["ema"])
-        start_epoch        = ckpt["epoch"] + 1
-        best_se            = ckpt["best_se"]
-        best_sp_at_best_se = ckpt.get("best_sp_at_best_se", 0.0)
-        print(f"   Resumed at epoch {start_epoch}  |  best Se so far: {best_se*100:.2f}%")
+        start_epoch = ckpt["epoch"] + 1
+        best_score  = ckpt.get("best_score", 0.0)   # ← CHANGED
+        print(f"   Resumed at epoch {start_epoch}  |  best Score so far: {best_score*100:.2f}%")
 
     # ── Loop ──────────────────────────────────────────────────────────────────
     print(f"🚀 Training — epochs {start_epoch} → {args.epochs}")
-    print(f"   Goal  : beat Se=68.31%  keep Sp ≥ {SP_FLOOR*100:.0f}%")
+    print(f"   Goal  : beat Score=68.10%  (Se=68.31%  Sp=67.89%)")
     print(f"   SOTA  : Se=68.31%  Sp=67.89%  Score=68.10%")
     print("=" * 60)
-# ── Log File Setup ────────────────────────────────────────────────────────
+
     log_path = os.path.join(args.checkpoint_dir, "training_log.csv")
-    
-    # If starting from epoch 1, create a fresh file and write the header
     if start_epoch == 1 or not os.path.exists(log_path):
         with open(log_path, "w") as f:
             f.write("Epoch,Train_Loss,Val_Se,Val_Sp,Val_Score\n")
-            
+
     for epoch in range(start_epoch, args.epochs + 1):
-        # ── Two-Phase Training Logic ──────────────────────────────────────────
+        # ── Two-Phase unfreezing ──────────────────────────────────────────────
         if epoch == 7:
             print("\n🔓 Phase 2: Unfreezing upper 4 AST layers for fine-tuning...")
             for i, layer in enumerate(base_model.ast.audio_spectrogram_transformer.encoder.layer):
-                if i >= 8:  # Keep bottom 8 frozen, unfreeze top 4
+                if i >= 8:
                     for param in layer.parameters():
                         param.requires_grad = True
 
@@ -177,52 +170,46 @@ def train(args):
         se, sp, score = icbhi_score(all_preds, all_labels_list)
         lr_now        = optimizer.base_optimizer.param_groups[0]["lr"]
 
-        beat_se = "✅" if se > 0.6831 else "  "
-        sp_warn = f"  ⚠️  Sp below floor ({SP_FLOOR*100:.0f}%)" if sp < SP_FLOOR else ""
-
+        beat_sota = "✅" if score > 0.6810 else "  "
         print(
             f"Epoch {epoch:02d} | lr={lr_now:.1e} | loss={running_loss/len(train_loader):.4f} | "
-            f"Se={se*100:.2f}%{beat_se}  Sp={sp*100:.2f}%  Score={score*100:.2f}%{sp_warn}"
+            f"Se={se*100:.2f}%  Sp={sp*100:.2f}%  Score={score*100:.2f}%{beat_sota}"
         )
 
-        # ── NEW: Append metrics to log file ───────────────────────────────────
         with open(log_path, "a") as f:
             f.write(f"{epoch},{running_loss/len(train_loader):.4f},{se:.4f},{sp:.4f},{score:.4f}\n")
 
-        # Save best: Se-first, only when Sp >= floor
-        # Save best: Se-first, only when Sp >= floor
-        if sp >= SP_FLOOR and se > best_se:
-            best_se            = se
-            best_sp_at_best_se = sp
+        # ← CHANGED: save when balanced score improves past floor — no Sp-separate gate
+        if score >= SCORE_FLOOR and score > best_score:
+            best_score = score
             torch.save(
                 {
                     "epoch": epoch,
                     "model": base_model.state_dict(),
                     "ema":   ema.state_dict(),
-                    "se":    best_se,
+                    "se":    se,
                     "sp":    sp,
                     "score": score,
                 },
                 os.path.join(args.checkpoint_dir, "best_model.pth"),
             )
-            print(f"   💾 New best  Se={best_se*100:.2f}%  Sp={sp*100:.2f}%  Score={score*100:.2f}%")
+            print(f"   💾 New best  Se={se*100:.2f}%  Sp={sp*100:.2f}%  Score={score*100:.2f}%")
 
         # Resume checkpoint — always overwrite
         torch.save(
             {
-                "epoch":              epoch,
-                "model":              base_model.state_dict(),
-                "optimizer":          optimizer.base_optimizer.state_dict(),
-                "scheduler":          scheduler.state_dict(),
-                "ema":                ema.state_dict(),
-                "best_se":            best_se,
-                "best_sp_at_best_se": best_sp_at_best_se,
+                "epoch":      epoch,
+                "model":      base_model.state_dict(),
+                "optimizer":  optimizer.base_optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+                "ema":        ema.state_dict(),
+                "best_score": best_score,           # ← CHANGED
             },
             resume_path,
         )
 
-    print(f"\n🏆 Best Se: {best_se*100:.2f}%   Sp at that checkpoint: {best_sp_at_best_se*100:.2f}%")
-    print(f"   Paper SOTA → Se: 68.31%  Sp: 67.89%")
+    print(f"\n🏆 Best Score: {best_score*100:.2f}%")
+    print(f"   Paper SOTA → Se: 68.31%  Sp: 67.89%  Score: 68.10%")
 
 
 if __name__ == "__main__":
