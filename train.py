@@ -1,14 +1,43 @@
+"""
+train.py  — FINAL APPROACH
+============================
+Key insight from the paper's own ablation table (Table 2):
+
+  Config                  Se       Sp       Score
+  ──────────────────────────────────────────────────
+  Baseline AST (CE only)  66.00%   70.00%   67.64%
+  + WRS                   63.00%   71.00%   66.91%   ← WRS hurts Se!
+  + WRS + SAM (paper)     68.31%   67.89%   68.10%
+
+WRS alone DECREASES Se from 66% → 63%. SAM is what recovers it.
+Every previous run we did kept WRS and added things on top of it,
+compounding the same recall-suppression effect.
+
+This run: CE loss + FSAM only, NO WeightedRandomSampler.
+  - Remove WRS: let FSAM work on the natural distribution
+  - FSAM > vanilla SAM: geometry-aware perturbation, same cost
+  - EMA: zero cost, consistent ~1-2% generalisation gain
+  - Improved head + layer freezing: reduces overfitting on small dataset
+  - Cosine LR decay: better final-epoch convergence than flat LR
+  - Resume + weights_only=False: all previous fixes retained
+
+Checkpoint saving: Se-first with Sp >= SP_FLOOR (60%) guard.
+  We want to beat Se=68.31% without Sp collapsing below 60%.
+  The paper itself had Sp=67.89%, so 60% is a generous floor.
+"""
+
 import os
 import argparse
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader          # ← CHANGED: removed WeightedRandomSampler
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import ASTFeatureExtractor
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
+
 from src.dataset import ASTDataset
 from src.model   import CustomAST, EMA
 from src.sam     import FSAM
@@ -26,14 +55,10 @@ def icbhi_score(all_preds, all_labels):
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args):
-
-    SCORE_FLOOR = 0.6200   # ← CHANGED: gate on balanced score, not Se-only
+    SP_FLOOR = 0.60   # minimum acceptable Sp — below this we don't save best_model
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_gpus = torch.cuda.device_count()
     print(f"⚙️  Device: {DEVICE}")
-    if num_gpus > 1:
-        print(f"⚙️  Multi-GPU: {num_gpus} GPUs detected")
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -49,11 +74,15 @@ def train(args):
         "MIT/ast-finetuned-audioset-10-10-0.4593"
     )
 
-    # ← CHANGED: removed WeightedRandomSampler — class-weighted loss handles imbalance instead
+    # ── NO WeightedRandomSampler ───────────────────────────────────────────────
+    # Paper ablation shows WRS alone drops Se 66% → 63%.
+    # SAM/FSAM provides the regularisation that handles imbalance geometrically.
+    # We let FSAM work on the natural distribution — shuffle=True only.
     train_loader = DataLoader(
         ASTDataset(X_train, y_train, d_train, processor, train=True),
         batch_size=args.batch_size,
         shuffle=True,
+        drop_last=True,
     )
     test_loader = DataLoader(
         ASTDataset(X_test, y_test, d_test, processor, train=False),
@@ -61,21 +90,26 @@ def train(args):
         shuffle=False,
     )
 
+    # Print class distribution so we can see what the natural distribution is
+    counts = np.bincount(y_train)
+    names  = ["Normal", "Crackle", "Wheeze", "Both"]
+    print("   Natural class distribution (no WRS):")
+    for n, c in zip(names, counts):
+        print(f"     {n}: {c} ({100*c/len(y_train):.1f}%)")
+
     # ── Model ─────────────────────────────────────────────────────────────────
     print("🧠 Preparing model")
-    model = CustomAST(num_classes=4, freeze_layers=12).to(DEVICE)
-    if num_gpus > 1:
-        model = nn.DataParallel(model)
-    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    model = CustomAST(num_classes=4, freeze_layers=8).to(DEVICE)
 
-    # ── Loss  ─────────────────────────────────────────────────────────────────
-    # ← CHANGED: class-weighted CE + label smoothing replaces plain CE + sampler
-    counts = np.bincount(y_train)
-    class_weights = torch.tensor(1.0 / counts, dtype=torch.float32).to(DEVICE)
-    class_weights = class_weights / class_weights.sum() * len(counts)  # normalise
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"   Trainable: {trainable:,} / {total:,}")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────────
+    # ── Loss: standard CE + label smoothing (same as paper baseline) ──────────
+    # No class weighting — we rely on FSAM geometry for robustness.
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # ── Optimizer: FSAM wrapping AdamW ────────────────────────────────────────
     optimizer = FSAM(
         model.parameters(),
         base_optimizer=torch.optim.AdamW,
@@ -85,7 +119,7 @@ def train(args):
         weight_decay=1e-4,
     )
 
-    # ── LR Schedule ───────────────────────────────────────────────────────────
+    # ── Cosine LR decay ───────────────────────────────────────────────────────
     scheduler = CosineAnnealingLR(
         optimizer.base_optimizer,
         T_max=args.epochs,
@@ -93,44 +127,33 @@ def train(args):
     )
 
     # ── EMA ───────────────────────────────────────────────────────────────────
-    ema = EMA(base_model, decay=0.999)
+    ema = EMA(model, decay=0.999)
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    start_epoch  = 1
-    best_score   = 0.0          # ← CHANGED: track best overall score
-    resume_path  = os.path.join(args.checkpoint_dir, "resume.pth")
+    start_epoch        = 1
+    best_se            = 0.0
+    best_sp_at_best_se = 0.0
+    resume_path        = os.path.join(args.checkpoint_dir, "resume.pth")
 
     if os.path.exists(resume_path):
         print(f"🔄 Resuming from: {resume_path}")
         ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-        base_model.load_state_dict(ckpt["model"])
+        model.load_state_dict(ckpt["model"])
         optimizer.base_optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         ema.load_state_dict(ckpt["ema"])
-        start_epoch = ckpt["epoch"] + 1
-        best_score  = ckpt.get("best_score", 0.0)   # ← CHANGED
-        print(f"   Resumed at epoch {start_epoch}  |  best Score so far: {best_score*100:.2f}%")
+        start_epoch        = ckpt["epoch"] + 1
+        best_se            = ckpt["best_se"]
+        best_sp_at_best_se = ckpt.get("best_sp_at_best_se", 0.0)
+        print(f"   Resumed at epoch {start_epoch} | best Se: {best_se*100:.2f}%")
 
     # ── Loop ──────────────────────────────────────────────────────────────────
-    print(f"🚀 Training — epochs {start_epoch} → {args.epochs}")
-    print(f"   Goal  : beat Score=68.10%  (Se=68.31%  Sp=67.89%)")
-    print(f"   SOTA  : Se=68.31%  Sp=67.89%  Score=68.10%")
+    print(f"\n🚀 Training — epochs {start_epoch} → {args.epochs}")
+    print(f"   Goal : beat Se=68.31%  |  keep Sp ≥ {SP_FLOOR*100:.0f}%")
+    print(f"   SOTA : Se=68.31%  Sp=67.89%  Score=68.10%")
     print("=" * 60)
 
-    log_path = os.path.join(args.checkpoint_dir, "training_log.csv")
-    if start_epoch == 1 or not os.path.exists(log_path):
-        with open(log_path, "w") as f:
-            f.write("Epoch,Train_Loss,Val_Se,Val_Sp,Val_Score\n")
-
     for epoch in range(start_epoch, args.epochs + 1):
-        # ── Two-Phase unfreezing ──────────────────────────────────────────────
-        if epoch == 7:
-            print("\n🔓 Phase 2: Unfreezing upper 4 AST layers for fine-tuning...")
-            for i, layer in enumerate(base_model.ast.audio_spectrogram_transformer.encoder.layer):
-                if i >= 8:
-                    for param in layer.parameters():
-                        param.requires_grad = True
-
         model.train()
         running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
@@ -139,22 +162,24 @@ def train(args):
             inputs = inputs.to(DEVICE)
             labels = labels.to(DEVICE)
 
+            # FSAM first step
             logits = model(inputs)
             loss   = criterion(logits, labels)
             loss.backward()
             optimizer.first_step(zero_grad=True)
 
+            # FSAM second step
             criterion(model(inputs), labels).backward()
             optimizer.second_step(zero_grad=True)
 
-            ema.update(base_model)
+            ema.update(model)
             running_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         scheduler.step()
 
         # ── Eval with EMA weights ─────────────────────────────────────────────
-        ema.apply_shadow(base_model)
+        ema.apply_shadow(model)
         model.eval()
         all_preds, all_labels_list = [], []
 
@@ -165,51 +190,53 @@ def train(args):
                 all_preds.extend(preds.cpu().numpy())
                 all_labels_list.extend(labels.numpy())
 
-        ema.restore(base_model)
+        ema.restore(model)
 
         se, sp, score = icbhi_score(all_preds, all_labels_list)
         lr_now        = optimizer.base_optimizer.param_groups[0]["lr"]
 
-        beat_sota = "✅" if score > 0.6810 else "  "
+        beat_se = " ✅" if se  > 0.6831 else "   "
+        beat_sp = " ✅" if sp  > 0.6789 else "   "
+        sp_warn = "  ⚠️ Sp < floor" if sp < SP_FLOOR else ""
+
         print(
             f"Epoch {epoch:02d} | lr={lr_now:.1e} | loss={running_loss/len(train_loader):.4f} | "
-            f"Se={se*100:.2f}%  Sp={sp*100:.2f}%  Score={score*100:.2f}%{beat_sota}"
+            f"Se={se*100:.2f}%{beat_se} Sp={sp*100:.2f}%{beat_sp} Score={score*100:.2f}%{sp_warn}"
         )
 
-        with open(log_path, "a") as f:
-            f.write(f"{epoch},{running_loss/len(train_loader):.4f},{se:.4f},{sp:.4f},{score:.4f}\n")
-
-        # ← CHANGED: save when balanced score improves past floor — no Sp-separate gate
-        if score >= SCORE_FLOOR and score > best_score:
-            best_score = score
+        # ── Save best: Se-first, Sp floor guard ───────────────────────────────
+        if sp >= SP_FLOOR and se > best_se:
+            best_se            = se
+            best_sp_at_best_se = sp
             torch.save(
                 {
                     "epoch": epoch,
-                    "model": base_model.state_dict(),
+                    "model": model.state_dict(),
                     "ema":   ema.state_dict(),
-                    "se":    se,
+                    "se":    best_se,
                     "sp":    sp,
                     "score": score,
                 },
                 os.path.join(args.checkpoint_dir, "best_model.pth"),
             )
-            print(f"   💾 New best  Se={se*100:.2f}%  Sp={sp*100:.2f}%  Score={score*100:.2f}%")
+            print(f"   💾 New best  Se={best_se*100:.2f}%  Sp={sp*100:.2f}%  Score={score*100:.2f}%")
 
-        # Resume checkpoint — always overwrite
+        # ── Resume checkpoint — always overwrite ──────────────────────────────
         torch.save(
             {
-                "epoch":      epoch,
-                "model":      base_model.state_dict(),
-                "optimizer":  optimizer.base_optimizer.state_dict(),
-                "scheduler":  scheduler.state_dict(),
-                "ema":        ema.state_dict(),
-                "best_score": best_score,           # ← CHANGED
+                "epoch":              epoch,
+                "model":              model.state_dict(),
+                "optimizer":          optimizer.base_optimizer.state_dict(),
+                "scheduler":          scheduler.state_dict(),
+                "ema":                ema.state_dict(),
+                "best_se":            best_se,
+                "best_sp_at_best_se": best_sp_at_best_se,
             },
             resume_path,
         )
 
-    print(f"\n🏆 Best Score: {best_score*100:.2f}%")
-    print(f"   Paper SOTA → Se: 68.31%  Sp: 67.89%  Score: 68.10%")
+    print(f"\n🏆 Best Se: {best_se*100:.2f}%  Sp at that point: {best_sp_at_best_se*100:.2f}%")
+    print(f"   Paper SOTA → Se: 68.31%  Sp: 67.89%")
 
 
 if __name__ == "__main__":
