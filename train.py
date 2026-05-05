@@ -28,7 +28,7 @@ Checkpoint saving: Se-first with Sp >= SP_FLOOR (60%) guard.
 
 import os
 import argparse
-
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import numpy as np
 import torch
 import torch.nn as nn
@@ -120,12 +120,13 @@ def train(args):
     )
 
     # ── Cosine LR decay ───────────────────────────────────────────────────────
-    scheduler = CosineAnnealingLR(
-        optimizer.base_optimizer,
-        T_max=args.epochs,
-        eta_min=1e-7,
-    )
 
+    scheduler = CosineAnnealingWarmRestarts(
+    optimizer.base_optimizer,
+    T_0=10,        # restart every 10 epochs
+    T_mult=1,
+    eta_min=1e-7,
+)
     # ── EMA ───────────────────────────────────────────────────────────────────
     ema = EMA(model, decay=0.999)
 
